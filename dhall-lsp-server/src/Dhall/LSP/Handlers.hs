@@ -14,8 +14,9 @@ import Dhall.Import (localToPath)
 import Dhall.Parser (Src(..))
 import Dhall.Pretty (CharacterSet(..))
 
-import Dhall.LSP.Backend.Completion (Completion(..), completionQueryAt,
-  completeEnvironmentImport, completeLocalImport, buildCompletionContext, completeProjections, completeFromContext)
+import Dhall.LSP.Backend.Completion (Completion(..), CompletionContext, completionQueryAt,
+  completeEnvironmentImport, completeLocalImport, buildCompletionContext,
+  completeProjections, completeSchema, completeSchemaLabels, completeFromContext, completeFromErrors)
 import Dhall.LSP.Backend.Dhall (FileIdentifier, parse, load, typecheck,
   fileIdentifierFromFilePath, fileIdentifierFromURI, invalidate, parseWithHeader)
 import Dhall.LSP.Backend.Diagnostics (Range(..), Diagnosis(..), explain,
@@ -24,7 +25,7 @@ import Dhall.LSP.Backend.Formatting (formatExpr, formatExprWithHeader)
 import Dhall.LSP.Backend.Freezing (computeSemanticHash, getImportHashPosition,
   stripHash, getAllImportsWithHashPositions)
 import Dhall.LSP.Backend.Linting (Suggestion(..), suggest, lint)
-import Dhall.LSP.Backend.Parsing (binderExprFromText)
+import Dhall.LSP.Backend.Parsing (binderExprFromText, recordSchemaForCompletion, recordSchemaForLabelCompletion)
 import Dhall.LSP.Backend.Typing (typeAt, annotateLet, exprAt)
 import Dhall.LSP.State
 
@@ -45,6 +46,8 @@ import qualified Network.URI as URI
 import qualified Network.URI.Encode as URI
 import Text.Megaparsec (SourcePos(..), unPos)
 import System.FilePath
+
+import Debug.Trace (traceShow)
 
 -- Workaround to make our single-threaded LSP fit dhall-lsp's API, which
 -- expects a multi-threaded implementation. Reports errors to the user via the
@@ -147,16 +150,17 @@ fileIdentifierFromUri uri =
 rangeToJSON :: Range -> J.Range
 rangeToJSON (Range (x1,y1) (x2,y2)) = J.Range (J.Position x1 y1) (J.Position x2 y2)
 
+isHovered :: Diagnosis -> Int -> Int -> Bool
+isHovered (Diagnosis _ (Just (Range left right)) _) line col =
+        left <= (line,col) && (line,col) <= right
+isHovered _ _ _= False
+
 hoverExplain :: J.HoverRequest -> HandlerM ()
 hoverExplain request = do
   let uri = request ^. J.params . J.textDocument . J.uri
       J.Position line col = request ^. J.params . J.position
   mError <- uses errors $ Map.lookup uri
-  let isHovered (Diagnosis _ (Just (Range left right)) _) =
-        left <= (line,col) && (line,col) <= right
-      isHovered _ = False
-
-      hoverFromDiagnosis (Diagnosis _ (Just (Range left right)) diagnosis) =
+  let hoverFromDiagnosis (Diagnosis _ (Just (Range left right)) diagnosis) =
         let _range = Just $ J.Range (uncurry J.Position left)
                                     (uncurry J.Position right)
             encodedDiag = URI.encode (Text.unpack diagnosis)
@@ -168,7 +172,7 @@ hoverExplain request = do
 
       mHover = do err <- mError
                   explanation <- explain err
-                  guard (isHovered explanation)
+                  guard (isHovered explanation line col)
                   hoverFromDiagnosis explanation
   lspRespond LSP.RspHover request mHover
 
@@ -194,7 +198,7 @@ hoverHandler request = do
   errorMap <- use errors
   case Map.lookup uri errorMap of
     Nothing -> hoverType request
-    _ -> hoverExplain request
+    _ -> hoverType request
 
 
 documentLinkHandler :: J.DocumentLinkRequest -> HandlerM ()
@@ -457,6 +461,42 @@ executeFreezeImport request = do
   lspRequest LSP.ReqApplyWorkspaceEdit J.WorkspaceApplyEdit
     (J.ApplyWorkspaceEditParams edit)
 
+errorCompletionHandler :: J.CompletionRequest -> HandlerM [Completion]
+errorCompletionHandler request = do
+  let uri = request ^. J.params . J.textDocument . J.uri
+      line = request ^. J.params . J.position . J.line
+      col = request ^. J.params . J.position . J.character
+  mError <- uses errors $ Map.lookup uri
+  return $ do
+        err <- maybeToList mError
+        explanation <- maybeToList $ explain err
+        guard (isHovered explanation line col)
+        completeFromErrors err
+
+completeWithBinderConext:: J.Uri -> Text ->  (Expr Src Import) -> (CompletionContext -> Expr Src Void -> [Completion]) -> HandlerM [Completion]
+completeWithBinderConext uri completionLeadup targetExpr completeFrom = do
+  let bindersExpr = binderExprFromText completionLeadup
+
+  fileIdentifier <- fileIdentifierFromUri uri
+  cache <- use importCache
+  loadedBinders <- liftIO $ load fileIdentifier bindersExpr cache
+
+  (cache', bindersExpr') <-
+    case loadedBinders of
+      Right (cache', binders) -> do
+        return (cache', binders)
+      Left _ -> throwE (Log, "Could not complete projection; failed to load binders expression.")
+
+  let completionContext = buildCompletionContext bindersExpr'
+
+  loaded' <- liftIO $ load fileIdentifier targetExpr cache'
+  case loaded' of
+    Right (cache'', targetExpr') -> do
+      assign importCache cache''
+      return (completeFrom completionContext targetExpr')
+    Left _ -> return []
+
+
 completionHandler :: J.CompletionRequest -> HandlerM ()
 completionHandler request = do
   let uri = request ^. J.params . J.textDocument . J.uri
@@ -464,8 +504,8 @@ completionHandler request = do
       col = request ^. J.params . J.position . J.character
 
   txt <- readUri uri
-  let (completionLeadup, completionPrefix) = completionQueryAt txt (line, col)
-
+  let (completionLeadup, completionPrefix) = traceShow (completionQueryAt txt (line, col)) (completionQueryAt txt (line, col))
+  
   let computeCompletions
         -- environment variable
         | "env:" `isPrefixOf` completionPrefix =
@@ -476,41 +516,21 @@ completionHandler request = do
           let relativeTo | Just path <- J.uriToFilePath uri = path
                          | otherwise = "."
           liftIO $ completeLocalImport relativeTo (Text.unpack completionPrefix)
-
+        | (Just schemaExpr) <- recordSchemaForLabelCompletion (completionLeadup<>completionPrefix) =
+           traceShow schemaExpr $ completeWithBinderConext uri completionLeadup schemaExpr completeSchemaLabels 
+        | (Just schemaExpr) <- recordSchemaForCompletion (completionLeadup<>completionPrefix) =
+           traceShow schemaExpr $ completeWithBinderConext uri completionLeadup schemaExpr completeSchema 
         -- record projection / union constructor
         | (target, _) <- Text.breakOnEnd "." completionPrefix
-        , not (Text.null target) = do
-          let bindersExpr = binderExprFromText completionLeadup
-
-          fileIdentifier <- fileIdentifierFromUri uri
-          cache <- use importCache
-          loadedBinders <- liftIO $ load fileIdentifier bindersExpr cache
-
-          (cache', bindersExpr') <-
-            case loadedBinders of
-              Right (cache', binders) -> do
-                return (cache', binders)
-              Left _ -> throwE (Log, "Could not complete projection; failed to load binders expression.")
-
-          let completionContext = buildCompletionContext bindersExpr'
-
-          targetExpr <- case parse (Text.dropEnd 1 target) of
-            Right e -> return e
-            Left _ -> throwE (Log, "Could not complete projection; prefix did not parse.")
-
-          loaded' <- liftIO $ load fileIdentifier targetExpr cache'
-          case loaded' of
-            Right (cache'', targetExpr') -> do
-              assign importCache cache''
-              return (completeProjections completionContext targetExpr')
-            Left _ -> return []
-
-        -- complete identifiers in scope
+        , not (Text.null target)
+        , (Right targetExpr) <- parse  (Text.dropEnd 1 target) =
+          completeWithBinderConext uri completionLeadup targetExpr completeProjections
         | otherwise = do
           let bindersExpr = binderExprFromText completionLeadup
 
           fileIdentifier <- fileIdentifierFromUri uri
-          cache <- use importCache  -- todo save cache afterwards
+
+          cache <- use importCache  -- todo save completeWithBinderConextcache afterwards
           loadedBinders <- liftIO $ load fileIdentifier bindersExpr cache
 
           bindersExpr' <-
@@ -519,9 +539,8 @@ completionHandler request = do
                 assign importCache cache'
                 return binders
               Left _ -> throwE (Log, "Could not complete projection; failed to load binders expression.")
-
           let context = buildCompletionContext bindersExpr'
-          return (completeFromContext context)
+          return $ completeFromContext context
 
   completions <- computeCompletions
 

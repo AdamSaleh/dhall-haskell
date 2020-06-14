@@ -7,18 +7,22 @@ module Dhall.LSP.Backend.Parsing
   , getLamIdentifier
   , getForallIdentifier
   , binderExprFromText
+  , recordSchemaForCompletion
+  , recordSchemaForLabelCompletion
   , holeExpr
   )
 where
 
+import Data.Foldable (foldl')
 import Data.Text (Text)
 import Dhall.Core (Binding(..), Expr(..), Import, Var(..))
 import Dhall.Src (Src(..))
 import Dhall.Parser
 import Dhall.Parser.Token hiding (text)
 import Dhall.Parser.Expression (getSourcePos, importType_, importHash_, localOnly)
-import Text.Megaparsec (try, skipManyTill, lookAhead, anySingle,
+import Text.Megaparsec (many, try, skipManyTill, lookAhead, anySingle,
   notFollowedBy, eof, takeRest)
+import qualified Text.Megaparsec.Char as C
 
 import Control.Applicative (optional, (<|>))
 import qualified Text.Megaparsec as Megaparsec
@@ -165,6 +169,79 @@ getImportLink src@(Src left _ text) =
 holeExpr :: Expr s a
 -- The illegal variable name ensures that it can't be bound by the user!
 holeExpr = Var (V "" 0)
+
+selectorExpression :: Parser (Expr Src Import)
+selectorExpression = do
+      a <- identifierVar
+
+      let recordType = _openParens *> whitespace *> expression <* whitespace <* _closeParens
+
+      let field               x  e = Field   e  x
+      let projectBySet        xs e = Project e (Left  xs)
+      let projectByExpression xs e = Project e (Right xs)
+
+      let alternatives = 
+                  fmap field               anyLabel
+              <|> fmap projectBySet        labels
+              <|> fmap projectByExpression recordType
+
+      b <- Text.Megaparsec.many (try (whitespace *> _dot *> whitespace *> alternatives))
+      return (foldl' (\e k -> k e) a b)
+    where
+      expression = expr
+
+identifierVar :: Parser (Expr Src a)
+identifierVar = do
+      a <- identifier
+      return (Var a)   
+
+recordSchemaForCompletion :: Text -> Maybe (Expr Src Import)
+recordSchemaForCompletion prefix =
+    Megaparsec.parseMaybe (unParser parseExpr) (prefix)
+  where
+    parseExpr = do
+      try (do
+        skipManyTill (C.printChar <|> C.spaceChar) (try schemaExpr))
+
+    schemaExpr = do
+      a <- selectorExpression
+      _doubleColon
+      return a
+   
+
+recordSchemaForLabelCompletion :: Text -> Maybe (Expr Src Import)
+recordSchemaForLabelCompletion prefix =
+    Megaparsec.parseMaybe (unParser parseExpr) (prefix)
+  where
+    parseExpr = do
+      try (do
+        skipManyTill (C.printChar <|> C.spaceChar) (try schemaExpr))
+
+    schemaExpr = do
+      a <- selectorExpression
+      _doubleColon
+      _openBrace
+      _ <- Text.Megaparsec.many (do
+        _comma
+
+        whitespace
+
+        c <- anyLabelOrSome
+
+        whitespace
+
+        _colon
+
+        nonemptyWhitespace
+
+        d <- expr
+
+        whitespace
+
+        return (c, d) )
+
+
+      return a
 
 -- | Approximate the type-checking context at the end of the input. Tries to
 -- parse as many binders as possible. Very messy!
